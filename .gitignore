@@ -2,3 +2,15 @@
 Videos
 *.mp4
 processed_dataset
+__pycache__
+
+tri_model_distilled_sports_multiclass_*
+tri_model_distilled_videomae
+videomae-base-finetuned-kinetics-finetuned-sports-videos-in-the-wild
+videomae-base-finetuned-sports-videos-in-the-wild
+videomae-base-finetuned-ucf101-finetuned-sports-videos-in-the-wild
+videomae-tiny-finetuned-kinetics-finetuned-sports-videos-in-the-wild
+tri_model_distilled_sports_multiclass
+wandb
+*.log
+distillation_analysis_results*
