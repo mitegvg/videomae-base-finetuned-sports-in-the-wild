@@ -9,6 +9,7 @@ tri_model_distilled_videomae
 videomae-base-finetuned-kinetics-finetuned-sports-videos-in-the-wild
 videomae-base-finetuned-sports-videos-in-the-wild
 videomae-base-finetuned-ucf101-finetuned-sports-videos-in-the-wild
+videomae-base-finetuned-*
 videomae-tiny-finetuned-kinetics-finetuned-sports-videos-in-the-wild
 tri_model_distilled_sports_multiclass
 wandb

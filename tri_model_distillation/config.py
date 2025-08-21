@@ -42,10 +42,12 @@ class TriModelConfig:
     # Distillation weights - FIXED: Reduced feature weight to prevent overwhelming
     feature_distillation_weight: float = 0.1  # Drastically reduced from 1.0
     attention_distillation_weight: float = 0.1  # Reduced from 0.3 
+    logits_distillation_weight: float = 0.8  # NEW: Logits distillation weight
     classification_loss_weight: float = 1.0  # Keep as primary focus
     
     # Temperature for distillation
     temperature: float = 6.0
+    logits_temperature: float = 4.0  # NEW: Separate temperature for logits distillation
     
     # Feature alignment configurations
     align_hidden_states: bool = True
@@ -55,6 +57,8 @@ class TriModelConfig:
     # Assistant model configurations
     assistant_feature_weight: float = 0.8
     teacher_feature_weight: float = 1.0
+    teacher_logits_weight: float = 1.0  # NEW: Weight for teacher logits
+    assistant_logits_weight: float = 0.6  # NEW: Weight for assistant logits
     
     # Training configurations
     num_frames: int = 16
@@ -110,29 +114,41 @@ class TriModelConfig:
         if self.classification_type == "binary":
             return {
                 "temperature": 6.0,
+                "logits_temperature": 3.0,  # NEW
                 "feature_distillation_weight": 0.1,
                 "attention_distillation_weight": 0.1,
+                "logits_distillation_weight": 0.7,  # NEW
                 "classification_loss_weight": 1.0,
                 "assistant_feature_weight": 0.8,
+                "assistant_logits_weight": 0.5,  # NEW
                 "teacher_feature_weight": 1.0,
+                "teacher_logits_weight": 1.0,  # NEW
             }
         elif self.classification_type == "multiclass":
             return {
                 "temperature": 4.0,  # Lower for multiclass
+                "logits_temperature": 4.0,  # NEW
                 "feature_distillation_weight": 0.1,
                 "attention_distillation_weight": 0.1,
+                "logits_distillation_weight": 0.8,  # NEW - Higher for multiclass
                 "classification_loss_weight": 1.0,
                 "assistant_feature_weight": 0.6,  # Reduced for multiclass
+                "assistant_logits_weight": 0.6,  # NEW
                 "teacher_feature_weight": 1.0,
+                "teacher_logits_weight": 1.0,  # NEW
             }
         elif self.classification_type == "multilabel":
             return {
                 "temperature": 3.0,  # Even lower for multilabel
+                "logits_temperature": 2.5,  # NEW - Lower for multilabel
                 "feature_distillation_weight": 0.15,
                 "attention_distillation_weight": 0.05,
+                "logits_distillation_weight": 0.6,  # NEW
                 "classification_loss_weight": 1.0,
                 "assistant_feature_weight": 0.5,
+                "assistant_logits_weight": 0.4,  # NEW
                 "teacher_feature_weight": 1.0,
+                "teacher_logits_weight": 1.0,  # NEW
             }
         else:
             raise ValueError(f"Unsupported classification_type: {self.classification_type}")

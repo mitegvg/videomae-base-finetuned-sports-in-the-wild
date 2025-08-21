@@ -26,10 +26,14 @@ class TriModelDistillationLoss(nn.Module):
         self,
         feature_distillation_weight: float = 1.0,
         attention_distillation_weight: float = 0.5,
+        logits_distillation_weight: float = 0.8,  # NEW: Logits distillation weight
         classification_loss_weight: float = 1.0,
         teacher_feature_weight: float = 1.0,
         assistant_feature_weight: float = 0.8,
+        teacher_logits_weight: float = 1.0,  # NEW: Weight for teacher logits
+        assistant_logits_weight: float = 0.6,  # NEW: Weight for assistant logits
         temperature: float = 4.0,
+        logits_temperature: float = 4.0,  # NEW: Separate temperature for logits distillation
         hidden_layers_to_align: List[int] = [-1, -2, -3],
         classification_type: str = "multiclass"
     ):
@@ -37,10 +41,14 @@ class TriModelDistillationLoss(nn.Module):
         
         self.feature_distillation_weight = feature_distillation_weight
         self.attention_distillation_weight = attention_distillation_weight
+        self.logits_distillation_weight = logits_distillation_weight  # NEW
         self.classification_loss_weight = classification_loss_weight
         self.teacher_feature_weight = teacher_feature_weight
         self.assistant_feature_weight = assistant_feature_weight
+        self.teacher_logits_weight = teacher_logits_weight  # NEW
+        self.assistant_logits_weight = assistant_logits_weight  # NEW
         self.temperature = temperature
+        self.logits_temperature = logits_temperature  # NEW
         self.hidden_layers_to_align = hidden_layers_to_align
         self.classification_type = classification_type
         
@@ -102,7 +110,15 @@ class TriModelDistillationLoss(nn.Module):
         else:
             losses['attention_distillation_loss'] = torch.tensor(0.0, device=labels.device)
         
-        # 4. Asymmetric Knowledge Transfer Loss
+        # 4. NEW: Logits Distillation Loss
+        logits_loss = self._compute_logits_distillation_loss(
+            student_outputs['logits'],
+            teacher_outputs['logits'],
+            assistant_outputs['logits']
+        )
+        losses['logits_distillation_loss'] = logits_loss
+        
+        # 5. Asymmetric Knowledge Transfer Loss
         asymmetric_loss = self._compute_asymmetric_knowledge_loss(
             teacher_outputs['hidden_states'],
             assistant_outputs['hidden_states']
@@ -114,6 +130,7 @@ class TriModelDistillationLoss(nn.Module):
             self.classification_loss_weight * classification_loss +
             self.feature_distillation_weight * feature_loss +
             self.attention_distillation_weight * losses['attention_distillation_loss'] +
+            self.logits_distillation_weight * logits_loss +  # NEW
             0.1 * asymmetric_loss  # Small weight for asymmetric loss
         )
         losses['total_loss'] = total_loss
@@ -156,6 +173,49 @@ class TriModelDistillationLoss(nn.Module):
                 num_layers += 1
         
         return total_loss / max(num_layers, 1)
+    
+    def _compute_logits_distillation_loss(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        assistant_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        NEW: Compute logits distillation loss from teacher and assistant to student.
+        
+        Uses KL divergence between softmax distributions at the specified temperature.
+        
+        Args:
+            student_logits: Student model logits [batch_size, num_classes]
+            teacher_logits: Teacher model logits [batch_size, num_classes]
+            assistant_logits: Assistant model logits [batch_size, num_classes]
+            
+        Returns:
+            Combined logits distillation loss
+        """
+        if self.classification_type == "multilabel":
+            # For multilabel, use MSE loss on logits directly
+            teacher_loss = self.mse_loss(student_logits, teacher_logits)
+            assistant_loss = self.mse_loss(student_logits, assistant_logits)
+        else:
+            # For binary/multiclass, use KL divergence with temperature scaling
+            
+            # Teacher -> Student logits distillation
+            student_soft = F.log_softmax(student_logits / self.logits_temperature, dim=1)
+            teacher_soft = F.softmax(teacher_logits / self.logits_temperature, dim=1)
+            teacher_loss = self.kl_div_loss(student_soft, teacher_soft) * (self.logits_temperature ** 2)
+            
+            # Assistant -> Student logits distillation
+            assistant_soft = F.softmax(assistant_logits / self.logits_temperature, dim=1)
+            assistant_loss = self.kl_div_loss(student_soft, assistant_soft) * (self.logits_temperature ** 2)
+        
+        # Weighted combination
+        total_logits_loss = (
+            self.teacher_logits_weight * teacher_loss +
+            self.assistant_logits_weight * assistant_loss
+        )
+        
+        return total_logits_loss
     
     def _compute_attention_distillation_loss(
         self,

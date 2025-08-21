@@ -60,8 +60,14 @@ class TriModelDistillationTrainer(Trainer):
         self.distillation_loss_fn = TriModelDistillationLoss(
             feature_distillation_weight=distillation_config.feature_distillation_weight,
             attention_distillation_weight=distillation_config.attention_distillation_weight,
+            logits_distillation_weight=distillation_config.logits_distillation_weight,  # NEW
             classification_loss_weight=distillation_config.classification_loss_weight,
+            teacher_feature_weight=distillation_config.teacher_feature_weight,
+            assistant_feature_weight=distillation_config.assistant_feature_weight,
+            teacher_logits_weight=distillation_config.teacher_logits_weight,  # NEW
+            assistant_logits_weight=distillation_config.assistant_logits_weight,  # NEW
             temperature=distillation_config.temperature,
+            logits_temperature=distillation_config.logits_temperature,  # NEW
             hidden_layers_to_align=distillation_config.hidden_layers_to_align,
             classification_type=distillation_config.classification_type
         )
@@ -141,10 +147,12 @@ class TriModelDistillationTrainer(Trainer):
         total_classification_loss = 0.0
         total_feature_loss = 0.0
         total_attention_loss = 0.0
+        total_logits_loss = 0.0  # NEW: Track logits distillation loss
         num_samples = 0
         
-        all_predictions = []
+        all_logits = []
         all_labels = []
+        all_pred_classes = []
         
         for step, inputs in enumerate(eval_dataloader):
             with torch.no_grad():
@@ -175,21 +183,32 @@ class TriModelDistillationTrainer(Trainer):
                 total_classification_loss += loss_dict['classification_loss'].item() * batch_size
                 total_feature_loss += loss_dict['feature_distillation_loss'].item() * batch_size
                 total_attention_loss += loss_dict['attention_distillation_loss'].item() * batch_size
+                total_logits_loss += loss_dict['logits_distillation_loss'].item() * batch_size  # NEW
                 num_samples += batch_size
                 
-                # Collect predictions for metrics
-                predictions = torch.argmax(outputs['student'].logits, dim=-1)
-                all_predictions.extend(predictions.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
+                # Collect logits and labels for comprehensive metrics
+                student_logits = outputs['student'].logits.detach().cpu().numpy()
+                all_logits.append(student_logits)
+                all_labels.append(labels.cpu().numpy())
+                
+                # Also keep quick argmax for cheap accuracies (optional)
+                all_pred_classes.append(student_logits.argmax(axis=-1))
+        
+        # Concatenate all collected data
+        import numpy as np
+        all_logits = np.concatenate(all_logits, axis=0)
+        all_labels = np.concatenate(all_labels, axis=0)
+        all_pred_classes = np.concatenate(all_pred_classes, axis=0)
         
         # Compute average losses
         avg_loss = total_loss / num_samples
         avg_classification_loss = total_classification_loss / num_samples
         avg_feature_loss = total_feature_loss / num_samples
         avg_attention_loss = total_attention_loss / num_samples
+        avg_logits_loss = total_logits_loss / num_samples  # NEW
         
-        # Compute accuracy
-        accuracy = np.mean(np.array(all_predictions) == np.array(all_labels))
+        # Compute quick accuracy using argmax predictions
+        accuracy = np.mean(all_pred_classes == all_labels)
         
         # FIXED: Use consistent metric naming without forward slashes
         eval_metrics = {
@@ -197,20 +216,17 @@ class TriModelDistillationTrainer(Trainer):
             f"{metric_key_prefix}_classification_loss": avg_classification_loss,
             f"{metric_key_prefix}_feature_distillation_loss": avg_feature_loss,
             f"{metric_key_prefix}_attention_distillation_loss": avg_attention_loss,
+            f"{metric_key_prefix}_logits_distillation_loss": avg_logits_loss,  # NEW
             f"{metric_key_prefix}_accuracy": accuracy,
         }
         
-        # Add additional metrics if available
-        if len(set(all_labels)) == 2:  # Binary classification
-            # Add binary metrics
-            pass
-        else:  # Multiclass
-            # Add multiclass metrics
-            pass
-        
-        # Additional metrics if compute_metrics is provided
+        # Use comprehensive metrics with logits for detailed evaluation
         if self.compute_metrics is not None:
-            additional_metrics = self.compute_metrics((all_predictions, all_labels))
+            # Pass logits to compute_metrics; it can argmax internally and compute advanced metrics
+            additional_metrics = self.compute_metrics(
+                (all_logits, all_labels),
+                classification_type=self.distillation_config.classification_type
+            )
             # Ensure consistent metric naming
             for k, v in additional_metrics.items():
                 eval_metrics[f"{metric_key_prefix}_{k}"] = v
