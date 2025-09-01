@@ -168,15 +168,20 @@ class TriModelDistillationFramework(nn.Module):
         id2label: Dict[int, str]
     ):
         super().__init__()
-        
         self.config = config
+        # Apply defaults only if user requested
+        if getattr(self.config, 'apply_defaults', False) and hasattr(self.config, 'apply_classification_defaults'):
+            self.config.apply_classification_defaults()
+        # Validate and gating flags (decided by current weights)
+        if hasattr(self.config, 'validate'):
+            self.config.validate()
+        self._refresh_gating()
+        
         self.num_labels = num_labels
         self.label2id = label2id
         self.id2label = id2label
         
-        # Apply classification-specific defaults if not already set
-        if hasattr(config, 'apply_classification_defaults'):
-            config.apply_classification_defaults()
+    # Avoid re-applying defaults silently; rely on earlier logic
         
         logger.info(f"Initializing Tri-Model Distillation Framework for {config.classification_type} classification...")
         
@@ -426,6 +431,12 @@ class TriModelDistillationFramework(nn.Module):
         Returns:
             Dictionary containing outputs from all three models
         """
+        # Override requested outputs with necessity-based gating (dynamic)
+        # Allows potential runtime change to config weights
+        self._refresh_gating()
+        output_hidden_states = self._need_hidden
+        output_attentions = self._need_attn
+
         # Ensure all models are on the same device as inputs
         target_device = pixel_values.device
         # Move teacher and assistant if needed (student is handled by HF Trainer)
@@ -460,11 +471,37 @@ class TriModelDistillationFramework(nn.Module):
                 output_attentions=output_attentions
             )
         
+        # Strip heavy fields if not needed
+        if not output_hidden_states:
+            if hasattr(student_outputs,'hidden_states'): student_outputs.hidden_states=None
+            if hasattr(teacher_outputs,'hidden_states'): teacher_outputs.hidden_states=None
+            if hasattr(assistant_outputs,'hidden_states'): assistant_outputs.hidden_states=None
+        if not output_attentions:
+            if hasattr(student_outputs,'attentions'): student_outputs.attentions=None
+            if hasattr(teacher_outputs,'attentions'): teacher_outputs.attentions=None
+            if hasattr(assistant_outputs,'attentions'): assistant_outputs.attentions=None
+        
         return {
             'student': student_outputs,
             'teacher': teacher_outputs,
             'assistant': assistant_outputs
         }
+
+    def _refresh_gating(self):
+        """Recompute whether hidden states / attentions are needed based on config.
+
+        Called at init and each forward so that notebook users can tweak
+        weights (e.g., set feature_distillation_weight=0) mid-session.
+        """
+        self._need_hidden = False
+        self._need_attn = False
+        try:
+            if hasattr(self.config, 'active_require_hidden'):
+                self._need_hidden = bool(self.config.active_require_hidden())
+            if hasattr(self.config, 'active_require_attn'):
+                self._need_attn = bool(self.config.active_require_attn())
+        except Exception as e:
+            logger.debug(f"Gating refresh failed: {e}")
     
     def get_student_model(self) -> VideoMAEForVideoClassification:
         """Get the student model for training/inference."""

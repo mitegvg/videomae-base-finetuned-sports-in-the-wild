@@ -10,7 +10,7 @@ import torch
 import logging
 from typing import Dict, List, Optional, Tuple, Any, Union
 from transformers import Trainer, TrainingArguments
-from transformers.trainer_utils import EvalLoopOutput
+from transformers.trainer_utils import EvalLoopOutput, denumpify_detensorize
 import numpy as np
 
 # Handle both relative and absolute imports
@@ -43,218 +43,297 @@ class TriModelDistillationTrainer(Trainer):
         args: TrainingArguments,
         **kwargs
     ):
-        """
-        Initialize the tri-model distillation trainer.
-        
-        Args:
-            framework: Tri-model distillation framework
-            distillation_config: Configuration for distillation
-            args: Training arguments
-            **kwargs: Additional arguments for base Trainer
-        """
-        # Store the framework and config for later access
+        """Initialize trainer and configure distillation components."""
+        # Framework & config
         self.framework = framework
         self.distillation_config = distillation_config
-        
-        # Initialize the distillation loss function and store it for post-training analysis
+
+        dc = distillation_config  # shorthand
+        # Construct loss fn with core weights
         self.distillation_loss_fn = TriModelDistillationLoss(
-            feature_distillation_weight=distillation_config.feature_distillation_weight,
-            attention_distillation_weight=distillation_config.attention_distillation_weight,
-            logits_distillation_weight=distillation_config.logits_distillation_weight,  # NEW
-            classification_loss_weight=distillation_config.classification_loss_weight,
-            teacher_feature_weight=distillation_config.teacher_feature_weight,
-            assistant_feature_weight=distillation_config.assistant_feature_weight,
-            teacher_logits_weight=distillation_config.teacher_logits_weight,  # NEW
-            assistant_logits_weight=distillation_config.assistant_logits_weight,  # NEW
-            temperature=distillation_config.temperature,
-            logits_temperature=distillation_config.logits_temperature,  # NEW
-            hidden_layers_to_align=distillation_config.hidden_layers_to_align,
-            classification_type=distillation_config.classification_type
+            feature_distillation_weight=dc.feature_distillation_weight,
+            attention_distillation_weight=dc.attention_distillation_weight,
+            logits_distillation_weight=dc.logits_distillation_weight,
+            classification_loss_weight=dc.classification_loss_weight,
+            teacher_feature_weight=dc.teacher_feature_weight,
+            assistant_feature_weight=dc.assistant_feature_weight,
+            teacher_logits_weight=dc.teacher_logits_weight,
+            assistant_logits_weight=dc.assistant_logits_weight,
+            teacher_attention_weight=getattr(dc, 'teacher_attention_weight', None),
+            assistant_attention_weight=getattr(dc, 'assistant_attention_weight', None),
+            temperature=dc.temperature,
+            logits_temperature=dc.logits_temperature,
+            hidden_layers_to_align=dc.hidden_layers_to_align,
+            classification_type=dc.classification_type,
         )
-        
-        # Store for post-training analysis
-        self.distillation_loss = self.distillation_loss_fn  # Add this for backward compatibility
-        
-        # Initialize base trainer with student model
-        super().__init__(
-            model=framework.get_student_model(),
-            args=args,
-            **kwargs
+        # Advanced settings
+        cfg = dc
+        dlf = self.distillation_loss_fn
+        dlf.enable_layer_fusion = getattr(cfg, 'enable_layer_fusion', False)
+        dlf.layer_fusion_mode = getattr(cfg, 'layer_fusion_mode', 'attention')
+        dlf.layer_fusion_teacher_layers = getattr(cfg, 'layer_fusion_teacher_layers', [])
+        dlf.layer_fusion_assistant_layers = getattr(cfg, 'layer_fusion_assistant_layers', [])
+        dlf.fusion_source = getattr(cfg, 'fusion_source', 'teacher')
+        dlf.fusion_source_weighting = getattr(cfg, 'fusion_source_weighting', 'learned')
+        dlf.fusion_teacher_weight = getattr(cfg, 'fusion_teacher_weight', 0.5)
+        dlf.fusion_assistant_weight = getattr(cfg, 'fusion_assistant_weight', 0.5)
+        dlf.fusion_projection_dim = getattr(cfg, 'fusion_projection_dim', None)
+        dlf.temporal_delta_distillation_weight = getattr(cfg, 'temporal_delta_distillation_weight', 0.0)
+        dlf.temporal_delta_layers = getattr(cfg, 'temporal_delta_layers', [-1])
+        dlf.attention_head_squeeze = getattr(cfg, 'attention_head_squeeze', False)
+        dlf.attention_head_squeeze_mode = getattr(cfg, 'attention_head_squeeze_mode', 'learned')
+        dlf.head_squeeze_ortho_weight = getattr(cfg, 'head_squeeze_ortho_weight', 1e-3)
+        # KD gating
+        dlf.kd_conf_threshold = getattr(cfg, 'kd_conf_threshold', 0.5)
+        dlf.kd_min_keep_ratio = getattr(cfg, 'kd_min_keep_ratio', 0.4)
+        dlf.kd_dynamic_lower = getattr(cfg, 'kd_dynamic_lower', True)
+
+        # Alias for backward compatibility
+        self.distillation_loss = dlf
+
+        # Init base Trainer on student model
+        super().__init__(model=framework.get_student_model(), args=args, **kwargs)
+        self._log_active_loss_weights()
+
+    # NEW: concise logging of active loss weights
+    def _log_active_loss_weights(self):
+        logger.info(
+            f"[Distillation Weights] cls={self.distillation_loss_fn.classification_loss_weight} "
+            f"feat={self.distillation_loss_fn.feature_distillation_weight} "
+            f"attn={self.distillation_loss_fn.attention_distillation_weight} "
+            f"logits={self.distillation_loss_fn.logits_distillation_weight} "
+            f"T={self.distillation_loss_fn.temperature} "
+            f"logits_T={getattr(self.distillation_loss_fn,'logits_temperature', None)}"
         )
+
+    def create_optimizer(self):
+        """Create optimizer including projection parameters from loss function."""
+        # First, run a dummy forward pass to ensure projections are created
+        self._ensure_projections_created()
+        
+        # Create base optimizer for student model
+        super().create_optimizer()
+        
+        # Add projection parameters to optimizer
+        extra_params = [p for p in self.distillation_loss_fn.parameters() if p.requires_grad]
+        if extra_params:
+            logger.info(f"Adding {len(extra_params)} projection parameters to optimizer")
+            self.optimizer.add_param_group({
+                "params": extra_params,
+                "lr": self.args.learning_rate * 0.1  # Lower LR for projections
+            })
+    
+    def _ensure_projections_created(self):
+        """Run a dummy forward pass to create projection layers."""
+        if hasattr(self, '_projections_created'):
+            return
+            
+        try:
+            # Get a sample from train dataloader
+            sample_batch = next(iter(self.get_train_dataloader()))
+            sample_batch = self._prepare_inputs(sample_batch)
+            
+            with torch.no_grad():
+                # Run forward pass to trigger projection creation
+                outputs = self.framework(
+                    pixel_values=sample_batch["pixel_values"][:1],  # Just one sample
+                    labels=sample_batch["labels"][:1] if "labels" in sample_batch else None,
+                    output_hidden_states=True,
+                    output_attentions=True
+                )
+                
+                # Trigger loss computation to create projections
+                _ = self.distillation_loss_fn(
+                    student_outputs=outputs['student'],
+                    teacher_outputs=outputs['teacher'],
+                    assistant_outputs=outputs['assistant'],
+                    labels=sample_batch["labels"][:1] if "labels" in sample_batch else torch.zeros(1, dtype=torch.long, device=outputs['student'].logits.device)
+                )
+                
+            self._projections_created = True
+            logger.info("Projection layers created and ready for training")
+            
+        except Exception as e:
+            logger.warning(f"Could not create projections in advance: {e}")
+            self._projections_created = True  # Set anyway to avoid infinite loops
     
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
         Compute tri-model distillation loss.
-        
-        Args:
-            model: Student model (from parent Trainer)
-            inputs: Batch inputs
-            return_outputs: Whether to return model outputs
-            num_items_in_batch: Number of items in batch (new in transformers 4.x)
-            
-        Returns:
-            Loss tensor and optionally model outputs
+        Must return a scalar tensor. Only return (loss, outputs) if return_outputs=True.
         """
-        
         # Extract inputs
         pixel_values = inputs["pixel_values"]
         labels = inputs["labels"]
-        
-        # Forward pass through all models
-        outputs = self.framework(
+
+        need_hidden = (
+            self.distillation_loss_fn.feature_distillation_weight > 0
+            or (self.distillation_config.align_hidden_states and len(self.distillation_config.hidden_layers_to_align) > 0)
+        )
+        need_attn = (
+            self.distillation_loss_fn.attention_distillation_weight > 0
+            or self.distillation_config.align_attention_maps
+        )
+
+        framework_outputs = self.framework(
             pixel_values=pixel_values,
             labels=labels,
-            output_hidden_states=True,
-            output_attentions=True
+            output_hidden_states=need_hidden,
+            output_attentions=need_attn
         )
-        
-        # Compute distillation loss
+
+        # Expect framework_outputs to contain student/teacher/assistant model outputs
         loss_dict = self.distillation_loss_fn(
-            student_outputs=outputs['student'],
-            teacher_outputs=outputs['teacher'],
-            assistant_outputs=outputs['assistant'],
+            student_outputs=framework_outputs["student"],
+            teacher_outputs=framework_outputs.get("teacher"),
+            assistant_outputs=framework_outputs.get("assistant"),
             labels=labels
         )
-        
-        total_loss = loss_dict['total_loss']
-        
-        # Log individual loss components
+
+        total_loss = loss_dict["total_loss"]
+
+        # Optional logging of components
         if self.state.global_step % self.args.logging_steps == 0:
-            for loss_name, loss_value in loss_dict.items():
-                if loss_name != 'total_loss':
-                    self.log({f"train/{loss_name}": loss_value.item()})
-        
+            try:
+                self.log({
+                    "loss_total": float(total_loss.detach()),
+                    "loss_cls": float(loss_dict.get("classification_loss", 0.0)),
+                    "loss_logits": float(loss_dict.get("logits_distillation_loss", 0.0)),
+                    "loss_feat": float(loss_dict.get("feature_distillation_loss", 0.0)),
+                    "loss_delta": float(loss_dict.get("temporal_delta_distillation_loss", 0.0)),
+                    "loss_attn": float(loss_dict.get("attention_distillation_loss", 0.0)),
+                    **({} if not (self.distillation_loss_fn.enable_layer_fusion and getattr(self.distillation_loss_fn, '_fusion_source_logits', None) is not None) else {
+                        "fusion_src_w_teacher": float(torch.softmax(self.distillation_loss_fn._fusion_source_logits, dim=0)[0].detach()),
+                        "fusion_src_w_assistant": float(torch.softmax(self.distillation_loss_fn._fusion_source_logits, dim=0)[1].detach()),
+                    })
+                })
+            except Exception:
+                pass
+
         if return_outputs:
-            return total_loss, outputs['student']
-        else:
-            return total_loss
+            return total_loss, framework_outputs["student"]
+        return total_loss
     
     def evaluate(
         self,
         eval_dataset: Optional[Any] = None,
         ignore_keys: Optional[List[str]] = None,
         metric_key_prefix: str = "eval",
-    ) -> Dict[str, float]:
-        """
-        Evaluation loop with tri-model distillation.
-        """
+    ):
+        """Robust evaluation supporting dynamic compute_metrics signature."""
+        import inspect
         eval_dataloader = self.get_eval_dataloader(eval_dataset)
-        
-        model = self.framework.get_student_model()
-        model.eval()
-        
-        total_loss = 0.0
-        total_classification_loss = 0.0
-        total_feature_loss = 0.0
-        total_attention_loss = 0.0
-        total_logits_loss = 0.0  # NEW: Track logits distillation loss
+        student = self.framework.get_student_model(); student.eval()
+        need_hidden = self.distillation_loss_fn.feature_distillation_weight > 0
+        need_attn = self.distillation_loss_fn.attention_distillation_weight > 0
+
+        total_loss = total_cls = total_feat = total_attn = total_logits = 0.0
         num_samples = 0
-        
-        all_logits = []
-        all_labels = []
-        all_pred_classes = []
-        
-        for step, inputs in enumerate(eval_dataloader):
+        all_logits, all_labels, all_pred = [], [], []
+
+        for inputs in eval_dataloader:
             with torch.no_grad():
-                # Move inputs to device
                 inputs = self._prepare_inputs(inputs)
-                pixel_values = inputs["pixel_values"]
-                labels = inputs["labels"]
-                
-                # Forward pass
+                pixel_values, labels = inputs["pixel_values"], inputs["labels"]
                 outputs = self.framework(
                     pixel_values=pixel_values,
                     labels=labels,
-                    output_hidden_states=True,
-                    output_attentions=True
+                    output_hidden_states=need_hidden,
+                    output_attentions=need_attn
                 )
-                
-                # Compute losses
                 loss_dict = self.distillation_loss_fn(
                     student_outputs=outputs['student'],
                     teacher_outputs=outputs['teacher'],
                     assistant_outputs=outputs['assistant'],
                     labels=labels
                 )
-                
-                # Accumulate losses
-                batch_size = labels.size(0)
-                total_loss += loss_dict['total_loss'].item() * batch_size
-                total_classification_loss += loss_dict['classification_loss'].item() * batch_size
-                total_feature_loss += loss_dict['feature_distillation_loss'].item() * batch_size
-                total_attention_loss += loss_dict['attention_distillation_loss'].item() * batch_size
-                total_logits_loss += loss_dict['logits_distillation_loss'].item() * batch_size  # NEW
-                num_samples += batch_size
-                
-                # Collect logits and labels for comprehensive metrics
-                student_logits = outputs['student'].logits.detach().cpu().numpy()
-                all_logits.append(student_logits)
+                bsz = labels.size(0)
+                num_samples += bsz
+                # Accumulate weighted by batch size
+                total_loss += float(loss_dict['total_loss']) * bsz
+                total_cls += float(loss_dict['classification_loss']) * bsz
+                total_feat += float(loss_dict.get('feature_distillation_loss', 0.0)) * bsz
+                total_attn += float(loss_dict.get('attention_distillation_loss', 0.0)) * bsz
+                total_logits += float(loss_dict.get('logits_distillation_loss', 0.0)) * bsz
+
+                logits_np = outputs['student'].logits.detach().cpu().numpy()
+                all_logits.append(logits_np)
                 all_labels.append(labels.cpu().numpy())
-                
-                # Also keep quick argmax for cheap accuracies (optional)
-                all_pred_classes.append(student_logits.argmax(axis=-1))
-        
-        # Concatenate all collected data
+                all_pred.append(logits_np.argmax(axis=-1))
+
         import numpy as np
-        all_logits = np.concatenate(all_logits, axis=0)
-        all_labels = np.concatenate(all_labels, axis=0)
-        all_pred_classes = np.concatenate(all_pred_classes, axis=0)
-        
-        # Compute average losses
-        avg_loss = total_loss / num_samples
-        avg_classification_loss = total_classification_loss / num_samples
-        avg_feature_loss = total_feature_loss / num_samples
-        avg_attention_loss = total_attention_loss / num_samples
-        avg_logits_loss = total_logits_loss / num_samples  # NEW
-        
-        # Compute quick accuracy using argmax predictions
-        accuracy = np.mean(all_pred_classes == all_labels)
-        
-        # FIXED: Use consistent metric naming without forward slashes
+        all_logits = np.concatenate(all_logits, axis=0) if all_logits else np.zeros((0,))
+        all_labels = np.concatenate(all_labels, axis=0) if all_labels else np.zeros((0,))
+        all_pred = np.concatenate(all_pred, axis=0) if all_pred else np.zeros((0,))
+
+        denom = max(num_samples, 1)
         eval_metrics = {
-            f"{metric_key_prefix}_loss": avg_loss,
-            f"{metric_key_prefix}_classification_loss": avg_classification_loss,
-            f"{metric_key_prefix}_feature_distillation_loss": avg_feature_loss,
-            f"{metric_key_prefix}_attention_distillation_loss": avg_attention_loss,
-            f"{metric_key_prefix}_logits_distillation_loss": avg_logits_loss,  # NEW
-            f"{metric_key_prefix}_accuracy": accuracy,
+            f"{metric_key_prefix}_loss": total_loss / denom,
+            f"{metric_key_prefix}_classification_loss": total_cls / denom,
+            f"{metric_key_prefix}_feature_distillation_loss": total_feat / denom,
+            f"{metric_key_prefix}_attention_distillation_loss": total_attn / denom,
+            f"{metric_key_prefix}_logits_distillation_loss": total_logits / denom,
+            f"{metric_key_prefix}_accuracy": float(np.mean(all_pred == all_labels)) if num_samples else 0.0,
         }
-        
-        # Use comprehensive metrics with logits for detailed evaluation
-        if self.compute_metrics is not None:
-            # Pass logits to compute_metrics; it can argmax internally and compute advanced metrics
-            additional_metrics = self.compute_metrics(
-                (all_logits, all_labels),
-                classification_type=self.distillation_config.classification_type
+
+        # Optional external metrics
+        if self.compute_metrics and num_samples:
+            try:
+                sig = inspect.signature(self.compute_metrics)
+                if 'classification_type' in sig.parameters:
+                    extra = self.compute_metrics((all_logits, all_labels), classification_type=self.distillation_config.classification_type)
+                else:
+                    extra = self.compute_metrics((all_logits, all_labels))
+                for k, v in extra.items():
+                    eval_metrics[f"{metric_key_prefix}_{k}"] = v
+            except Exception as e:
+                logger.warning(f"compute_metrics failed: {e}")
+
+        try:
+            if metric_key_prefix == 'eval':
+                self._memory_tracker.stop_and_update_metrics(eval_metrics)
+        except Exception:
+            logger.warning("Memory tracking failed")
+            pass
+
+        self.log(eval_metrics)
+
+        # Fire callback so NotebookProgressCallback / custom callbacks can record a row
+        # Ensure an 'epoch' field is present (NotebookProgressCallback uses it when eval_strategy='epoch')
+        if hasattr(self.state, "epoch") and self.state.epoch is not None:
+            eval_metrics["epoch"] = self.state.epoch
+
+        try:
+            # Callback handler expects (args, state, control, metrics)
+            # Ensure self.control exists (created by Trainer during train(); fall back if absent)
+            from transformers.trainer_callback import TrainerControl
+            if not hasattr(self, "control") or self.control is None:
+                self.control = TrainerControl()
+            self.control = self.callback_handler.on_evaluate(
+                self.args, self.state, self.control, eval_metrics
             )
-            # Ensure consistent metric naming
-            for k, v in additional_metrics.items():
-                eval_metrics[f"{metric_key_prefix}_{k}"] = v
-        
+        except Exception as e:
+            logger.warning(f"on_evaluate callback dispatch failed: {e}")
+
         return eval_metrics
     
-    def prediction_step(
-        self,
-        model: torch.nn.Module,
-        inputs: Dict[str, Union[torch.Tensor, Any]],
-        prediction_loss_only: bool,
-        ignore_keys: Optional[List[str]] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    def prediction_step(self, model: torch.nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], prediction_loss_only: bool, ignore_keys: Optional[List[str]] = None):
         """
         Prediction step for evaluation.
         """
         inputs = self._prepare_inputs(inputs)
-        
+        need_hidden = self.distillation_loss_fn.feature_distillation_weight > 0
+        # keep attentions off for speed unless needed
+        need_attn = self.distillation_loss_fn.attention_distillation_weight > 0
         with torch.no_grad():
-            pixel_values = inputs["pixel_values"]
-            labels = inputs.get("labels")
+            pixel_values = inputs["pixel_values"]; labels = inputs.get("labels")
             
             # Forward pass through framework
             outputs = self.framework(
                 pixel_values=pixel_values,
                 labels=labels,
-                output_hidden_states=True,
-                output_attentions=False  # Save memory during eval
+                output_hidden_states=need_hidden,
+                output_attentions=need_attn
             )
             
             student_outputs = outputs['student']
@@ -291,19 +370,129 @@ class TriModelDistillationTrainer(Trainer):
         # Save framework configuration
         config_path = os.path.join(output_dir, "tri_model_config.json")
         import json
-        
+        c = self.distillation_config
         config_dict = {
-            "teacher_model_name": self.distillation_config.teacher_model_name,
-            "student_model_name": self.distillation_config.student_model_name,
-            "feature_distillation_weight": self.distillation_config.feature_distillation_weight,
-            "attention_distillation_weight": self.distillation_config.attention_distillation_weight,
-            "classification_loss_weight": self.distillation_config.classification_loss_weight,
-            "teacher_feature_weight": self.distillation_config.teacher_feature_weight,
-            "assistant_feature_weight": self.distillation_config.assistant_feature_weight,
-            "temperature": self.distillation_config.temperature,
-            "hidden_layers_to_align": self.distillation_config.hidden_layers_to_align,
+            "teacher_model_name": c.teacher_model_name,
+            "assistant_model_name": getattr(c, 'assistant_model_name', None),
+            "student_model_name": c.student_model_name,
+            "feature_distillation_weight": c.feature_distillation_weight,
+            "attention_distillation_weight": c.attention_distillation_weight,
+            "logits_distillation_weight": getattr(c, 'logits_distillation_weight', None),
+            "classification_loss_weight": c.classification_loss_weight,
+            "teacher_feature_weight": c.teacher_feature_weight,
+            "assistant_feature_weight": c.assistant_feature_weight,
+            "teacher_logits_weight": getattr(c, 'teacher_logits_weight', None),
+            "assistant_logits_weight": getattr(c, 'assistant_logits_weight', None),
+            "temperature": c.temperature,
+            "logits_temperature": getattr(c, 'logits_temperature', None),
+            "hidden_layers_to_align": c.hidden_layers_to_align,
+            "classification_type": getattr(c, 'classification_type', None),
+            "num_labels": getattr(c, 'num_labels', None),
         }
+        with open(config_path, 'w') as f:
+            json.dump(config_dict, f, indent=2)
         
+        logger.info(f"Tri-model distillation framework saved to {output_dir}")
+    
+    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+        """
+        Enhanced logging with distillation-specific metrics.
+        Compatible with both old and new transformers versions.
+        """
+        # Add model information to logs periodically
+        if self.state.global_step % (self.args.logging_steps * 10) == 0:
+            model_info = self.framework.get_model_info()
+            logs.update({
+                "model/student_params": model_info['student']['trainable_parameters'],
+                "model/teacher_params": model_info['teacher']['num_parameters'],
+                "model/assistant_params": model_info['assistant']['num_parameters'],
+            })
+        
+        # Call parent log method with compatible signature
+        if start_time is not None:
+            try:
+                # Try new signature first (transformers >= 4.20)
+                super().log(logs, start_time)
+            except TypeError:
+                # Fall back to old signature
+                super().log(logs)
+        else:
+            super().log(logs)
+
+    # (Removed duplicate evaluate method below to avoid shadowing.)
+    
+    def prediction_step(self, model: torch.nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], prediction_loss_only: bool, ignore_keys: Optional[List[str]] = None):
+        """
+        Prediction step for evaluation.
+        """
+        inputs = self._prepare_inputs(inputs)
+        need_hidden = self.distillation_loss_fn.feature_distillation_weight > 0
+        # keep attentions off for speed unless needed
+        need_attn = self.distillation_loss_fn.attention_distillation_weight > 0
+        with torch.no_grad():
+            pixel_values = inputs["pixel_values"]; labels = inputs.get("labels")
+            
+            # Forward pass through framework
+            outputs = self.framework(
+                pixel_values=pixel_values,
+                labels=labels,
+                output_hidden_states=need_hidden,
+                output_attentions=need_attn
+            )
+            
+            student_outputs = outputs['student']
+            
+            # Compute loss if labels are available
+            loss = None
+            if labels is not None:
+                loss_dict = self.distillation_loss_fn(
+                    student_outputs=outputs['student'],
+                    teacher_outputs=outputs['teacher'],
+                    assistant_outputs=outputs['assistant'],
+                    labels=labels
+                )
+                loss = loss_dict['total_loss']
+            
+            # Get predictions
+            logits = student_outputs.logits
+            
+        if prediction_loss_only:
+            return (loss, None, None)
+        
+        return (loss, logits, labels)
+    
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        """
+        Save the student model and framework configuration.
+        """
+        if output_dir is None:
+            output_dir = self.args.output_dir
+        
+        # Save student model
+        self.framework.save_student_model(output_dir)
+        
+        # Save framework configuration
+        config_path = os.path.join(output_dir, "tri_model_config.json")
+        import json
+        c = self.distillation_config
+        config_dict = {
+            "teacher_model_name": c.teacher_model_name,
+            "assistant_model_name": getattr(c, 'assistant_model_name', None),
+            "student_model_name": c.student_model_name,
+            "feature_distillation_weight": c.feature_distillation_weight,
+            "attention_distillation_weight": c.attention_distillation_weight,
+            "logits_distillation_weight": getattr(c, 'logits_distillation_weight', None),
+            "classification_loss_weight": c.classification_loss_weight,
+            "teacher_feature_weight": c.teacher_feature_weight,
+            "assistant_feature_weight": c.assistant_feature_weight,
+            "teacher_logits_weight": getattr(c, 'teacher_logits_weight', None),
+            "assistant_logits_weight": getattr(c, 'assistant_logits_weight', None),
+            "temperature": c.temperature,
+            "logits_temperature": getattr(c, 'logits_temperature', None),
+            "hidden_layers_to_align": c.hidden_layers_to_align,
+            "classification_type": getattr(c, 'classification_type', None),
+            "num_labels": getattr(c, 'num_labels', None),
+        }
         with open(config_path, 'w') as f:
             json.dump(config_dict, f, indent=2)
         
@@ -415,8 +604,8 @@ def compute_video_classification_metrics(eval_pred, classification_type="multicl
                 "f1_micro": f1_micro,
                 "f1_weighted": f1_weighted,
                 "precision_macro": precision_macro,
-                "precision_micro": precision_micro,
                 "recall_macro": recall_macro,
+                "precision_micro": precision_micro,
                 "recall_micro": recall_micro,
             })
             

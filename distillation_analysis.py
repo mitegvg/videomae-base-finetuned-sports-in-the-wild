@@ -46,15 +46,19 @@ warnings.filterwarnings("ignore")
 
 # Configuration
 MODELS = {
-    "teacher": "mitegvg/videomae-base-kinetics-binary-finetuned-xd-violence",
-    "assistant": "mitegvg/videomae-base-ssv2-binary-finetuned-xd-violence", 
-    "student": "mitegvg/videomae-tiny-binary-finetuned-xd-violence",
-    "distilled": "tri_model_distillation_production_20250731_185621/checkpoint-1050"
+    "teacher": "mitegvg/videomae-base-finetuned-kinetics-finetuned-sports-videos-in-the-wild",
+    "assistant": "contextual_bridge_runs_20250901_065642/stage1_teacher_to_small", 
+    "student": "mitegvg/videomae-tiny-12-finetuned-kinetics-finetuned-sports-videos-in-the-wild",
+    "distilled": "contextual_bridge_runs_20250901_065642/stage2_small_to_tiny"
 }
+
+# - Teacher: `mitegvg/videomae-base-finetuned-kinetics-finetuned-sports-videos-in-the-wild`
+# - Assistant: `mitegvg/videomae-base-finetuned-ssv2-finetuned-sports-videos-in-the-wild`
+# - Student (pretrained): `mitegvg/videomae-tiny-finetuned-kinetics-finetuned-sports-videos-in-the-wild`
 
 TEST_CSV = "processed_dataset/test.csv"
 RESULTS_DIR = "distillation_analysis_results"
-SAMPLE_SIZE = 100  # Number of videos to analyze for detailed metrics
+SAMPLE_SIZE = 422  # Use full test set for accurate results (same as notebook)
 
 # Create results directory
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -129,10 +133,10 @@ class DistillationAnalyzer:
             return 0, "N/A", 0, "N/A"
     
     def measure_inference_latency(self, model, processor, num_runs=50):
-        """Measure inference latency"""
+        """Measure inference latency using consistent approach"""
         print(f"Measuring inference latency ({num_runs} runs)...")
         
-        # Create dummy video input
+        # Create dummy video input (same as notebook preprocessing)
         dummy_frames = [np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8) for _ in range(16)]
         
         latencies = []
@@ -140,7 +144,7 @@ class DistillationAnalyzer:
         # Warmup runs
         for _ in range(5):
             with torch.no_grad():
-                inputs = processor(dummy_frames, return_tensors="pt", do_rescale=False)
+                inputs = processor(dummy_frames, return_tensors="pt")
                 inputs = {k: v.to(device) for k, v in inputs.items()}
                 _ = model(**inputs)
         
@@ -152,7 +156,7 @@ class DistillationAnalyzer:
             start_time = time.perf_counter()
             
             with torch.no_grad():
-                inputs = processor(dummy_frames, return_tensors="pt", do_rescale=False)
+                inputs = processor(dummy_frames, return_tensors="pt")
                 inputs = {k: v.to(device) for k, v in inputs.items()}
                 outputs = model(**inputs)
             
@@ -171,7 +175,7 @@ class DistillationAnalyzer:
         }
     
     def extract_features_and_logits(self, model, processor, video_paths, labels):
-        """Extract features and logits from model"""
+        """Extract features and logits from model using consistent evaluation approach"""
         features = []
         logits = []
         predictions = []
@@ -181,12 +185,13 @@ class DistillationAnalyzer:
         
         for video_path, label in tqdm(zip(video_paths, labels), total=len(video_paths)):
             try:
-                # Read and process video
-                frames = self.read_video(video_path)
+                # Read and process video using the same approach as notebook
+                frames = self.read_video_consistent(video_path)
                 if frames is None:
                     continue
                 
-                inputs = processor(frames, return_tensors="pt", do_rescale=False)
+                # Process frames exactly like the notebook evaluation
+                inputs = processor(frames, return_tensors="pt")
                 inputs = {k: v.to(device) for k, v in inputs.items()}
                 
                 with torch.no_grad():
@@ -263,10 +268,10 @@ class DistillationAnalyzer:
         
         return results
     
-    def read_video(self, video_path, num_frames=16):
-        """Read video and return frames"""
+    def read_video_consistent(self, video_path, num_frames=16):
+        """Read video using the same approach as the notebook evaluation for consistency"""
         try:
-            # Ensure path is correct
+            # Ensure path is correct - same logic as notebook
             if not os.path.exists(video_path) and 'processed_dataset' not in video_path:
                 video_path = os.path.join('processed_dataset', video_path)
             
@@ -282,20 +287,16 @@ class DistillationAnalyzer:
                 cap.release()
                 return None
             
-            # Sample frames uniformly
+            # Sample frames uniformly (exactly like notebook)
             frame_indices = np.linspace(0, frame_count - 1, num_frames, dtype=int)
             frames = []
             
-            for i, frame_idx in enumerate(frame_indices):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            for idx in frame_indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                 ret, frame = cap.read()
                 if not ret:
                     break
-                
-                # Convert BGR to RGB and resize
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame = cv2.resize(frame, (224, 224))
-                frame = frame.astype(np.float32) / 255.0
                 frames.append(frame)
             
             cap.release()
@@ -689,15 +690,15 @@ class DistillationAnalyzer:
         return deployment_metrics
     
     def measure_memory_usage(self, model, processor):
-        """Measure GPU memory usage with correct VideoMAE inputs"""
+        """Measure GPU memory usage with correct VideoMAE inputs using consistent preprocessing"""
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             
-            # Run a forward pass
+            # Run a forward pass with consistent preprocessing
             dummy_frames = [np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8) for _ in range(16)]
             with torch.no_grad():
-                inputs = processor(dummy_frames, return_tensors="pt", do_rescale=False)
+                inputs = processor(dummy_frames, return_tensors="pt")
                 inputs = {k: v.to(device) for k, v in inputs.items()}
                 _ = model(**inputs)
             
@@ -823,27 +824,39 @@ class DistillationAnalyzer:
         plt.close()
     
     def load_sample_data(self):
-        """Load sample data for analysis (multiclass-ready)"""
+        """Load sample data for analysis (consistent with notebook evaluation)"""
         print(f"Loading sample data from {TEST_CSV}...")
         
-        # Read CSV without headers - format is: video_path label
-        df = pd.read_csv(TEST_CSV, sep=' ', header=None, names=['video_path', 'label'])
+        # Read CSV without headers - format is: video_path label (same as notebook)
+        samples = []
+        with open(TEST_CSV, "r") as f:
+            for line in f.readlines():
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    relative_video_path = parts[0]
+                    label_str = parts[1]
+                    # Construct full path exactly like notebook
+                    full_video_path = os.path.normpath(os.path.join("processed_dataset", relative_video_path))
+                    samples.append((full_video_path, label_str))
+        
+        # Create DataFrame for easier manipulation
+        df = pd.DataFrame(samples, columns=['video_path', 'label'])
         
         # Multiclass label mapping
         unique_labels = sorted(df['label'].unique())
         label_to_id = {label: idx for idx, label in enumerate(unique_labels)}
         id_to_label = {idx: label for label, idx in label_to_id.items()}
 
-        # Fix video paths - ensure they point to processed_dataset/videos/
-        df['video_path'] = df['video_path'].apply(lambda x: x.replace('videos\\', 'videos/').replace('videos/', 'processed_dataset/videos/'))
-
-        # Sample videos for analysis
-        sample_df = df.sample(n=min(SAMPLE_SIZE, len(df)), random_state=42)
+        # Sample videos for analysis (use larger sample for more accurate results)
+        # Use min of SAMPLE_SIZE or total available, but ensure we get representative sample
+        effective_sample_size = min(SAMPLE_SIZE, len(df))
+        sample_df = df.sample(n=effective_sample_size, random_state=42)
         
         video_paths = sample_df['video_path'].tolist()
         labels = [label_to_id[x] for x in sample_df['label'].tolist()]
         
         print(f"Loaded {len(sample_df)} samples across {len(unique_labels)} classes")
+        print(f"Label mapping: {len(unique_labels)} unique labels")
         
         return {
             'video_paths': video_paths,

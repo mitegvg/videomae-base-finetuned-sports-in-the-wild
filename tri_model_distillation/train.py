@@ -9,7 +9,7 @@ import os
 import torch
 import logging
 from datetime import datetime
-from transformers import TrainingArguments
+from transformers import TrainingArguments, TrainerCallback, TrainerControl, TrainerState
 
 # Import framework components
 from .config import TriModelConfig, SSV2ModelConfig
@@ -104,16 +104,19 @@ def train_tri_model_distillation(
         eval_steps=eval_steps,
         save_steps=save_steps,
         logging_steps=logging_steps,
-        evaluation_strategy="steps",
-        save_strategy="steps",
+        evaluation_strategy="epoch",
+        logging_strategy="epoch",
+        save_strategy="epoch",
         load_best_model_at_end=True,
-        metric_for_best_model="eval/accuracy",
+        metric_for_best_model="eval_accuracy",
         greater_is_better=True,
-        save_total_limit=3,
+        save_total_limit=40,
         remove_unused_columns=False,
         dataloader_pin_memory=False,
         run_name=run_name,
-        report_to=None,  # Disable wandb/tensorboard for now
+        report_to=["tensorboard", "wandb"], 
+        logging_dir=os.path.join(output_dir, "logs"),
+        disable_tqdm=False, 
         seed=42,
     )
     
@@ -162,6 +165,14 @@ def train_tri_model_distillation(
         eval_dataset=val_loader.dataset,
         compute_metrics=compute_video_classification_metrics,
     )
+    
+    class EvalPrintCallback(TrainerCallback):
+        def on_evaluate(self, args, state: TrainerState, control: TrainerControl, metrics, **kwargs):
+            acc = metrics.get("eval_accuracy")
+            if acc is not None:
+                print(f"[EVAL] step {state.global_step} | eval_accuracy={acc:.4f}")
+
+    trainer.add_callback(EvalPrintCallback())
     
     # Save configuration
     config_save_path = os.path.join(output_dir, "training_config.json")
@@ -215,10 +226,10 @@ def train_tri_model_distillation(
         
         # Save final results
         final_results = {
-            "train_results": train_results.training_metrics if hasattr(train_results, 'training_metrics') else {},
+            "train_results": getattr(train_results, 'training_metrics', {}),
             "val_metrics": val_metrics,
             "test_metrics": test_metrics,
-            "best_model_checkpoint": training_args.output_dir,
+            "best_model_checkpoint": trainer.state.best_model_checkpoint,
         }
         
         results_path = os.path.join(output_dir, "final_results.json")
@@ -228,9 +239,13 @@ def train_tri_model_distillation(
         print("TRAINING COMPLETED SUCCESSFULLY!")
         print("=" * 60)
         print(f"Model saved to: {output_dir}")
-        print(f"Final validation accuracy: {val_metrics.get('eval/accuracy', 'N/A'):.4f}")
-        print(f"Final test accuracy: {test_metrics.get('test/accuracy', 'N/A'):.4f}")
+        print(f"Final validation accuracy: {val_metrics.get('eval_accuracy', 'N/A'):.4f}")
+        print(f"Final test accuracy: {test_metrics.get('test_accuracy', 'N/A'):.4f}")
         print("=" * 60)
+        
+        print("Last 5 log history entries:")
+        for row in trainer.state.log_history[-5:]:
+            print(row)
         
         return framework, trainer, final_results
         

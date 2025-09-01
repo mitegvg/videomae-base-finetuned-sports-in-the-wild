@@ -30,7 +30,8 @@ from .utils import (
     load_dataset_from_csv,
     preprocess_video_data,
     compute_metrics,
-    create_binary_label_mapping
+    create_binary_label_mapping,
+    make_metrics_fn
 )
 
 # New modules
@@ -77,7 +78,7 @@ __all__ = [
     "TriModelDistillationTrainer", "compute_video_classification_metrics",
     
     # Utilities
-    "load_dataset_from_csv", "preprocess_video_data", "compute_metrics", "create_binary_label_mapping",
+    "load_dataset_from_csv", "preprocess_video_data", "compute_metrics", "create_binary_label_mapping", "make_metrics_fn",
     
     # New modules
     "analyze_model_architecture", "calculate_efficiency_metrics", "print_model_comparison",

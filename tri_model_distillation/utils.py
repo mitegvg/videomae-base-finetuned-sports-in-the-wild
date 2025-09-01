@@ -11,7 +11,8 @@ import torch
 import numpy as np
 import cv2
 import logging
-from typing import Dict, List, Tuple, Optional, Any
+import json
+from typing import Dict, List, Tuple, Optional, Any, Callable
 from torch.utils.data import Dataset, DataLoader
 import pytorchvideo.data
 from pytorchvideo.transforms import (
@@ -678,73 +679,111 @@ def _load_video_frames_efficient(video_path: str, num_frames: int = 16) -> Optio
             cap.release()
 
 
-def compute_metrics(eval_preds):
-    """
-    Compute comprehensive evaluation metrics for model predictions.
-    
-    Args:
-        eval_preds: Tuple of (predictions, labels)
-        
-    Returns:
-        Dictionary of computed metrics including accuracy, F1, precision, recall, and specificity
+def compute_metrics(eval_preds, classification_type: str = "binary", **kwargs):
+    """Unified metrics function supporting multiple input formats and task types.
+
+    Accepts either:
+      - EvalPrediction-like object with attributes .predictions and .label_ids
+      - Tuple/List (predictions, labels)
+
+    Features:
+      - Binary: accuracy, precision, recall, f1, specificity, confusion components
+      - Multiclass (>2 classes): accuracy, macro/weighted precision/recall/F1
+      - Automatically ignores extra kwargs (for compatibility with HF Trainer)
     """
     from sklearn.metrics import (
-        accuracy_score, precision_recall_fscore_support, 
-        confusion_matrix, classification_report
+        accuracy_score, precision_recall_fscore_support, confusion_matrix
     )
-    
-    predictions, labels = eval_preds
-    
-    # Handle different prediction formats
-    if isinstance(predictions, list):
-        predictions = np.array(predictions)
-    if isinstance(labels, list):
-        labels = np.array(labels)
-    
-    # Get predicted class (argmax of logits if needed)
-    if len(predictions.shape) > 1 and predictions.shape[1] > 1:
-        pred_classes = np.argmax(predictions, axis=1)
-    else:
-        pred_classes = predictions.flatten().astype(int)
-    
-    # Ensure labels are integers
-    true_labels = labels.flatten().astype(int)
-    
-    # Calculate comprehensive metrics
-    accuracy = accuracy_score(true_labels, pred_classes)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        true_labels, pred_classes, average='binary', zero_division=0
-    )
-    
-    # Calculate confusion matrix for additional metrics
+
     try:
-        tn, fp, fn, tp = confusion_matrix(true_labels, pred_classes).ravel()
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-        
-        return {
-            'accuracy': accuracy,
-            'f1': f1,
+        # Unpack inputs
+        if hasattr(eval_preds, "predictions") and hasattr(eval_preds, "label_ids"):
+            predictions, labels = eval_preds.predictions, eval_preds.label_ids
+        else:
+            predictions, labels = eval_preds
+
+        if isinstance(predictions, list):
+            predictions = np.array(predictions)
+        if isinstance(labels, list):
+            labels = np.array(labels)
+
+        predictions = np.asarray(predictions)
+        labels = np.asarray(labels)
+
+        # Determine class predictions
+        if predictions.ndim > 1 and predictions.shape[-1] > 1:
+            pred_classes = np.argmax(predictions, axis=-1)
+        else:
+            pred_classes = predictions.reshape(-1).astype(int)
+
+        true_labels = labels.reshape(-1).astype(int)
+
+        acc = accuracy_score(true_labels, pred_classes) if len(true_labels) else 0.0
+        unique_classes = np.unique(true_labels) if len(true_labels) else []
+        num_classes = len(unique_classes)
+
+        # Decide averaging mode
+        average_mode = 'binary' if (classification_type == 'binary' or num_classes == 2) else 'macro'
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            true_labels, pred_classes, average=average_mode, zero_division=0
+        ) if num_classes > 0 else (0.0, 0.0, 0.0, None)
+
+        metrics: Dict[str, Any] = {
+            'accuracy': acc,
             'precision': precision,
             'recall': recall,
-            'specificity': specificity,
-            'true_positives': int(tp),
-            'true_negatives': int(tn),
-            'false_positives': int(fp),
-            'false_negatives': int(fn)
-        }
-    except ValueError:
-        # Fallback for edge cases
-        return {
-            'accuracy': accuracy,
             'f1': f1,
-            'precision': precision,
-            'recall': recall,
-            'specificity': 0.0,
-            'true_positives': 0,
-            'true_negatives': 0,
-            'false_positives': 0,
-            'false_negatives': 0
+            'num_classes': num_classes
         }
+
+        # Binary-specific extras
+        if num_classes == 2:
+            try:
+                tn, fp, fn, tp = confusion_matrix(true_labels, pred_classes).ravel()
+                specificity = tn / (tn + fp) if (tn + fp) else 0.0
+                metrics.update({
+                    'specificity': specificity,
+                    'true_positives': int(tp),
+                    'true_negatives': int(tn),
+                    'false_positives': int(fp),
+                    'false_negatives': int(fn)
+                })
+            except Exception:
+                pass
+
+        # Multiclass macro & weighted metrics (aligns with notebook expectations)
+        if num_classes > 2:
+            p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(
+                true_labels, pred_classes, average='macro', zero_division=0
+            )
+            p_weighted, r_weighted, f1_weighted, _ = precision_recall_fscore_support(
+                true_labels, pred_classes, average='weighted', zero_division=0
+            )
+            metrics.update({
+                'macro_precision': p_macro,
+                'macro_recall': r_macro,
+                'macro_f1': f1_macro,
+                'weighted_precision': p_weighted,
+                'weighted_recall': r_weighted,
+                'weighted_f1': f1_weighted
+            })
+
+        return metrics
+    except Exception as e:
+        logger.warning(f"compute_metrics failed: {e}")
+        return {'accuracy': 0.0}
+
+
+def make_metrics_fn(classification_type: str = "multiclass") -> Callable:
+    """Factory producing a Trainer-compatible metrics function.
+
+    Example:
+        metrics_fn = make_metrics_fn("multiclass")
+        trainer = TriModelDistillationTrainer(..., compute_metrics=metrics_fn)
+    """
+    def _fn(eval_pred):
+        return compute_metrics(eval_pred, classification_type=classification_type)
+    return _fn
 
 
 def analyze_post_training_performance(

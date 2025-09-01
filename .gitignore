@@ -15,3 +15,10 @@ tri_model_distilled_sports_multiclass
 wandb
 *.log
 distillation_analysis_results*
+contextual_bridge_runs*
+videomae-small*
+videomae-tiny*
+reports*
+tri_model_distillation_backup
+tri_model_distillation_without_mapping
+transformers-version.py

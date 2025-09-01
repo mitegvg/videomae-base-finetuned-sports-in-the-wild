@@ -3,10 +3,12 @@ Configuration classes for Tri-Model Asymmetric Distillation Framework
 """
 
 import os
+import math
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 from transformers import TrainingArguments
 import logging
+import inspect
 
 logger = logging.getLogger(__name__)
 
@@ -15,173 +17,277 @@ logger = logging.getLogger(__name__)
 class TriModelConfig:
     """Configuration for the Tri-Model Asymmetric Distillation Framework"""
     
-    # Classification type configuration
-    classification_type: str = "binary"  # "binary", "multiclass", or "multilabel"
-    num_labels: int = 2  # Number of target classes
+    # Classification type
+    classification_type: str = "binary"
+    num_labels: int = 2
     
-    # Model configurations
+    # Model names
     teacher_model_name: str = "MCG-NJU/videomae-base"
-    assistant_model_path: Optional[str] = None  # Path to SSV2 pretrained model
-    assistant_model_name: Optional[str] = None  # HuggingFace model name for assistant
+    assistant_model_path: Optional[str] = None
+    assistant_model_name: Optional[str] = None
     student_model_name: str = "MCG-NJU/videomae-base"
     
-    # Student model configuration - PROGRESSIVE DISTILLATION ENABLED
-    use_tiny_student: bool = True  # Create a tiny student model
+    # Student shape
+    use_tiny_student: bool = True
     use_pretrained_student: bool = True
-    pretrained_student_model: Optional[str] = None  # HF model name - will use student_model_name if None
-    student_num_layers: int = 4  # Number of layers in student model (vs 12 in teacher)
-    student_hidden_size: int = 384  # Hidden size for student (vs 768 in teacher)
-    student_num_attention_heads: int = 6  # Attention heads (vs 12 in teacher)
+    pretrained_student_model: Optional[str] = None
+    student_num_layers: int = 4
+    student_hidden_size: int = 384
+    student_num_attention_heads: int = 6
     
-    def __post_init__(self):
-        """Post-initialization to set smart defaults"""
-        # If pretrained_student_model is not set, default to student_model_name
-        if self.pretrained_student_model is None:
-            self.pretrained_student_model = self.student_model_name
+    # Distillation weights
+    feature_distillation_weight: float = 0.0
+    attention_distillation_weight: float = 0.0
+    logits_distillation_weight: float = 0.3
+    classification_loss_weight: float = 1.0
+    # Advanced / new distillation components
+    temporal_delta_distillation_weight: float = 0.0  # Motion-aware (Delta) distillation
+    temporal_delta_layers: List[int] = field(default_factory=lambda: [-1])
+    enable_layer_fusion: bool = False  # Multi-layer fusion (ALP-KD style)
+    layer_fusion_mode: str = "attention"  # 'attention' | 'uniform'
+    layer_fusion_teacher_layers: List[int] = field(default_factory=list)  # empty => all teacher layers
+    # New: assistant & multi-source fusion
+    fusion_source: str = "teacher"  # 'teacher' | 'assistant' | 'both'
+    layer_fusion_assistant_layers: List[int] = field(default_factory=list)  # empty => all assistant layers (when used)
+    fusion_source_weighting: str = "learned"  # 'learned' | 'fixed'
+    fusion_teacher_weight: float = 0.5  # used if weighting = fixed & fusion_source == 'both'
+    fusion_assistant_weight: float = 0.5
+    fusion_projection_dim: Optional[int] = None  # optional bottleneck dim for fusion projections
+    attention_head_squeeze: bool = False  # SHD style head squeezing
+    attention_head_squeeze_mode: str = "learned"  # 'learned' | 'avg'
+    head_squeeze_ortho_weight: float = 1e-3  # orthogonality penalty weight for head mixing projection
+    # Convenience explicit flags (optional overrides for ensuring outputs)
+    temporal_delta_use_projection: bool = False  # (placeholder for future use)
+    require_hidden_states: bool = False  # force output_hidden_states even if weights zero
+    require_attentions: bool = False     # force output_attentions even if weights zero
     
-    # Distillation weights - FIXED: Reduced feature weight to prevent overwhelming
-    feature_distillation_weight: float = 0.1  # Drastically reduced from 1.0
-    attention_distillation_weight: float = 0.1  # Reduced from 0.3 
-    logits_distillation_weight: float = 0.8  # NEW: Logits distillation weight
-    classification_loss_weight: float = 1.0  # Keep as primary focus
-    
-    # Temperature for distillation
+    # Temperatures
     temperature: float = 6.0
-    logits_temperature: float = 4.0  # NEW: Separate temperature for logits distillation
+    logits_temperature: float = 4.0
     
-    # Feature alignment configurations
+    # Alignment
     align_hidden_states: bool = True
     align_attention_maps: bool = True
-    hidden_layers_to_align: List[int] = field(default_factory=lambda: [-1, -2, -3])  # Last 3 layers
+    hidden_layers_to_align: List[int] = field(default_factory=lambda: [-1])
     
-    # Assistant model configurations
+    # Source weights
     assistant_feature_weight: float = 0.8
     teacher_feature_weight: float = 1.0
-    teacher_logits_weight: float = 1.0  # NEW: Weight for teacher logits
-    assistant_logits_weight: float = 0.6  # NEW: Weight for assistant logits
+    teacher_logits_weight: float = 1.0
+    assistant_logits_weight: float = 0.6
+    # NEW: explicit attention source weights (optional). If None -> derived from feature weights.
+    teacher_attention_weight: Optional[float] = None
+    assistant_attention_weight: Optional[float] = None
+    # Logits KD gating
+    kd_conf_threshold: float = 0.5          # assistant max prob threshold τ
+    kd_min_keep_ratio: float = 0.25         # if fewer kept, relax threshold
+    kd_dynamic_lower: bool = True           # allow automatic threshold relaxation
     
-    # Training configurations
+    # Data / video
     num_frames: int = 16
     image_size: int = 224
-    mask_ratio: float = 0.0  # No masking for student during distillation
+    mask_ratio: float = 0.0
     
-    # Dataset configurations
+    # Dataset
     dataset_root: str = "processed_dataset"
     train_csv: str = "train.csv"
     val_csv: str = "val.csv"
     test_csv: str = "test.csv"
     
-    # Output configurations
+    # Output & scheduling
     output_dir: str = "tri_model_distilled_videomae"
     save_strategy: str = "epoch"
-    eval_strategy: str = "epoch"
+    evaluation_strategy: str = "epoch"      # canonical
+    eval_strategy: Optional[str] = None     # deprecated alias
     
     # Logging
     logging_steps: int = 10
     save_total_limit: int = 3
+    apply_defaults: bool = False
     
-    def validate_label_compatibility(self, label2id: dict) -> bool:
-        """
-        Validate that the configuration is compatible with the dataset labels.
-        """
-        if self.use_pretrained_student and self.pretrained_student_model:
-            try:
-                from transformers import VideoMAEConfig
-                pretrained_config = VideoMAEConfig.from_pretrained(self.pretrained_student_model)
-                
-                if hasattr(pretrained_config, 'label2id') and pretrained_config.label2id:
-                    pretrained_labels = set(pretrained_config.label2id.keys())
-                    dataset_labels = set(label2id.keys())
-                    
-                    overlap = pretrained_labels.intersection(dataset_labels)
-                    compatibility_ratio = len(overlap) / len(dataset_labels)
-                    
-                    if compatibility_ratio < 0.3:  # Less than 30% overlap
-                        logger.warning(f"Low label compatibility: {compatibility_ratio:.1%}")
-                        logger.warning("Consider using use_pretrained_student=False for better performance")
-                        return False
-                    else:
-                        logger.info(f"Good label compatibility: {compatibility_ratio:.1%}")
-                        return True
-                        
-            except Exception as e:
-                logger.warning(f"Could not validate label compatibility: {e}")
-                return False
-        
-        return True
+    def __post_init__(self):
+        if self.eval_strategy and not self.evaluation_strategy:
+            self.evaluation_strategy = self.eval_strategy
+        if self.pretrained_student_model is None:
+            self.pretrained_student_model = self.student_model_name
+        # Only apply defaults if user explicitly asked
+        if self.apply_defaults:
+            self.apply_classification_defaults()
+        # Derive attention weights if not explicitly provided (mirror feature weights, normalized)
+        if self.teacher_attention_weight is None or self.assistant_attention_weight is None:
+            t_fw = float(self.teacher_feature_weight)
+            a_fw = float(self.assistant_feature_weight)
+            denom = max(t_fw + a_fw, 1e-8)
+            if self.teacher_attention_weight is None:
+                self.teacher_attention_weight = t_fw / denom
+            if self.assistant_attention_weight is None:
+                self.assistant_attention_weight = a_fw / denom
+        # Validation & info
+        try:
+            self.validate()
+        except Exception:
+            pass
+    
     def get_classification_defaults(self) -> Dict[str, Any]:
-        """Get default parameters based on classification type"""
         if self.classification_type == "binary":
             return {
                 "temperature": 6.0,
-                "logits_temperature": 3.0,  # NEW
-                "feature_distillation_weight": 0.1,
-                "attention_distillation_weight": 0.1,
-                "logits_distillation_weight": 0.7,  # NEW
-                "classification_loss_weight": 1.0,
-                "assistant_feature_weight": 0.8,
-                "assistant_logits_weight": 0.5,  # NEW
+                "logits_temperature": 3.0,
+                "feature_distillation_weight": 0.0,
+                "attention_distillation_weight": 0.0,
+                "logits_distillation_weight": 0.2,
+                "classification_loss_weight": 0.7,
+                "assistant_feature_weight": 1.0,
+                "assistant_logits_weight": 1.0,
                 "teacher_feature_weight": 1.0,
-                "teacher_logits_weight": 1.0,  # NEW
+                "teacher_logits_weight": 1.0,
             }
         elif self.classification_type == "multiclass":
             return {
-                "temperature": 4.0,  # Lower for multiclass
-                "logits_temperature": 4.0,  # NEW
-                "feature_distillation_weight": 0.1,
-                "attention_distillation_weight": 0.1,
-                "logits_distillation_weight": 0.8,  # NEW - Higher for multiclass
+                "temperature": 4.0,
+                "logits_temperature": 4,
+                "feature_distillation_weight": 0.03,
+                "attention_distillation_weight": 0.2,
+                "logits_distillation_weight": 0.5,
                 "classification_loss_weight": 1.0,
-                "assistant_feature_weight": 0.6,  # Reduced for multiclass
-                "assistant_logits_weight": 0.6,  # NEW
-                "teacher_feature_weight": 1.0,
-                "teacher_logits_weight": 1.0,  # NEW
+                "assistant_feature_weight": 1.0,
+                "assistant_logits_weight": 1.0,
+                "teacher_feature_weight": 0.2,
+                "teacher_logits_weight": 0.2,
             }
         elif self.classification_type == "multilabel":
             return {
-                "temperature": 3.0,  # Even lower for multilabel
-                "logits_temperature": 2.5,  # NEW - Lower for multilabel
-                "feature_distillation_weight": 0.15,
-                "attention_distillation_weight": 0.05,
-                "logits_distillation_weight": 0.6,  # NEW
+                "temperature": 3.0,
+                "logits_temperature": 2.5,
+                "feature_distillation_weight": 0.0,
+                "attention_distillation_weight": 0.0,
+                "logits_distillation_weight": 0.2,
                 "classification_loss_weight": 1.0,
                 "assistant_feature_weight": 0.5,
-                "assistant_logits_weight": 0.4,  # NEW
+                "assistant_logits_weight": 0.4,
                 "teacher_feature_weight": 1.0,
-                "teacher_logits_weight": 1.0,  # NEW
+                "teacher_logits_weight": 1.0,
             }
         else:
             raise ValueError(f"Unsupported classification_type: {self.classification_type}")
     
     def apply_classification_defaults(self):
-        """Apply classification-specific defaults to the config"""
-        defaults = self.get_classification_defaults()
-        for key, value in defaults.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
+        """Apply tuned defaults but do not override user-modified values.
 
+        Heuristic: only overwrite if current value equals the dataclass field default.
+        """
+        defaults = self.get_classification_defaults()
+        changed = {}
+        for k, v in defaults.items():
+            if hasattr(self, k):
+                field_def = type(self).__dataclass_fields__[k].default
+                current = getattr(self, k)
+                if current == field_def:
+                    setattr(self, k, v)
+                    changed[k] = v
+        if changed:
+            logger.info("[TriModelConfig] Applied defaults: " + ", ".join(f"{k}={v}" for k,v in changed.items()))
+    
     def to_training_args(self, **kwargs) -> TrainingArguments:
-        """Convert to TrainingArguments for HuggingFace Trainer"""
-        # Base/default arguments from config
-        args = {
+        base = {
             "output_dir": self.output_dir,
-            "save_strategy": self.save_strategy,
-            "eval_strategy": self.eval_strategy,
-            "logging_steps": self.logging_steps,
             "save_total_limit": self.save_total_limit,
             "remove_unused_columns": False,
             "dataloader_pin_memory": False,
         }
-
-        # Normalize deprecated/alternate argument names for compatibility across
-        # transformers versions (e.g., evaluation_strategy -> eval_strategy)
-        if "evaluation_strategy" in kwargs and "eval_strategy" not in kwargs:
-            args["eval_strategy"] = kwargs.pop("evaluation_strategy")
-
-        # Merge the rest of kwargs, allowing explicit kwargs to override defaults
-        args.update(kwargs)
-
-        return TrainingArguments(**args)
+        # Prefer explicit overrides passed in call
+        if "evaluation_strategy" in kwargs:
+            eval_strat = kwargs["evaluation_strategy"]
+        else:
+            eval_strat = self.evaluation_strategy
+        if "save_strategy" in kwargs:
+            save_strat = kwargs["save_strategy"]
+        else:
+            save_strat = self.save_strategy
+        
+        # Compose
+        base.update(kwargs)
+        # Insert canonical keys (may be renamed below)
+        base.setdefault("evaluation_strategy", eval_strat)
+        base.setdefault("save_strategy", save_strat)
+        
+        # Introspect TrainingArguments to adapt
+        sig = inspect.signature(TrainingArguments.__init__)
+        params = sig.parameters
+        
+        if "evaluation_strategy" not in params and "eval_strategy" in params:
+            # Legacy variant
+            base["eval_strategy"] = base.pop("evaluation_strategy")
+        # Drop unsupported keys gracefully
+        for maybe in ("evaluation_strategy", "save_strategy", "logging_strategy"):
+            if maybe in base and maybe not in params:
+                base.pop(maybe)
+        
+        # Optional debug
+        if "eval_strategy" in base and "evaluation_strategy" not in params:
+            logger.debug("[TriModelConfig] Using legacy eval_strategy fallback.")
+        
+        return TrainingArguments(**base)
+    
+    def active_require_hidden(self) -> bool:
+        fusion_active = False
+        if self.enable_layer_fusion:
+            if self.fusion_source == 'teacher':
+                fusion_active = True
+            elif self.fusion_source == 'assistant':
+                fusion_active = True
+            elif self.fusion_source == 'both':
+                fusion_active = True
+        return bool(
+            (self.feature_distillation_weight > 0)
+            or (self.attention_distillation_weight > 0)
+            or (self.temporal_delta_distillation_weight > 0)
+            or fusion_active
+        )
+    
+    def active_require_attn(self) -> bool:
+        return (self.attention_distillation_weight > 0) or self.align_attention_maps
+    
+    def validate(self):
+        errors = []
+        valid = set(self.__dataclass_fields__.keys())
+        unexpected = [k for k in self.__dict__.keys() if k not in valid]
+        # Fusion validation (only if enabled)
+        if self.enable_layer_fusion:
+            if self.fusion_source not in {"teacher", "assistant", "both"}:
+                errors.append(
+                    f"fusion_source must be 'teacher','assistant','both'; got {self.fusion_source}"
+                )
+            if self.fusion_source == 'teacher':
+                if self.layer_fusion_teacher_layers and any(l < 0 for l in self.layer_fusion_teacher_layers):
+                    errors.append("layer_fusion_teacher_layers must be non-negative indices")
+            if self.fusion_source == 'assistant':
+                if self.layer_fusion_assistant_layers and any(l < 0 for l in self.layer_fusion_assistant_layers):
+                    errors.append("layer_fusion_assistant_layers must be non-negative indices")
+            if self.fusion_source == 'both':
+                if self.fusion_source_weighting not in {"learned", "fixed"}:
+                    errors.append(
+                        f"fusion_source_weighting must be 'learned' or 'fixed'; got {self.fusion_source_weighting}"
+                    )
+                if self.fusion_source_weighting == 'fixed':
+                    total = self.fusion_teacher_weight + self.fusion_assistant_weight
+                    if not math.isclose(total, 1.0, rel_tol=1e-3):
+                        errors.append(
+                            f"For fixed weighting fusion_teacher_weight + fusion_assistant_weight must sum to 1 (got {total:.4f})"
+                        )
+        if unexpected:
+            import warnings
+            warnings.warn(f"TriModelConfig: Ignoring unexpected fields: {unexpected}")
+        if errors:
+            raise ValueError("TriModelConfig validation errors: \n" + "\n".join(errors))
+        logger.info(
+            f"[TriModelConfig] Active components => "
+            f"logits:{self.logits_distillation_weight>0} "
+            f"features:{self.feature_distillation_weight>0} "
+            f"attn:{self.attention_distillation_weight>0} "
+            f"attn_w=({self.teacher_attention_weight:.3f},{self.assistant_attention_weight:.3f}) "
+            f"apply_defaults={self.apply_defaults}"
+        )
 
 
 @dataclass
